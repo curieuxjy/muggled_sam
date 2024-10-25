@@ -19,4 +19,4 @@ env/
 # Catch-all for local ignorables
 ignore/
 saved_images/
-
+.idea/
