@@ -47,8 +47,12 @@ def convert_state_dict_keys(config_dict: dict, original_state_dict: dict) -> dic
         if found_key(new_key):
 
             # Correct layernorm2d weight shapes
-            layernorm_key_hints = ("output_projection.1", "output_projection.3")
+            layernorm_key_hints = ("channel_projection.1", "channel_projection.3")
             mod_data = _reshape_layernorm2d(new_key, orig_data, *layernorm_key_hints)
+
+            # Reshape base-position encoding (from 1xHxWxC to 1xCxHxW)
+            if new_key == "posenc.base_embedding_bchw":
+                mod_data = mod_data.permute(0, 3, 1, 2)
 
             imgenc_sd[new_key] = mod_data
             continue
@@ -108,7 +112,9 @@ def _reshape_layernorm2d(key, data, *key_hints):
 
     return data
 
+
 # .....................................................................................................................
+
 
 def _convert_imgenc_keys(key: str, blocks_per_stage: int) -> None | str:
     """
@@ -116,7 +122,7 @@ def _convert_imgenc_keys(key: str, blocks_per_stage: int) -> None | str:
     Takes care of:
         - position embeddings
         - transformer blocks (including re-structuring as stages)
-        - output projection ('neck') layers
+        - channel projection ('neck') layers
     """
 
     # Bail on non-image encoder keys
@@ -130,11 +136,11 @@ def _convert_imgenc_keys(key: str, blocks_per_stage: int) -> None | str:
 
     # Handle position embedding
     if key.startswith("image_encoder.pos_embed"):
-        return key.replace("image_encoder.pos_embed", "posenc.base_embedding")
+        return key.replace("image_encoder.pos_embed", "posenc.base_embedding_bchw")
 
-    # Handle output ('neck') layers
+    # Handle 'neck' layers
     if key.startswith("image_encoder.neck"):
-        return key.replace("image_encoder.neck", "output_projection")
+        return key.replace("image_encoder.neck", "channel_projection")
 
     # Handle transformer blocks (bulk of the model)
     if key.startswith("image_encoder.blocks"):
@@ -150,17 +156,24 @@ def _convert_imgenc_keys(key: str, blocks_per_stage: int) -> None | str:
         is_global_block = block_idx_within_stage == global_block_idx_within_stage
 
         # Update key to account for stage indexing
-        # image_encoder.blocks.6.norm1.weight -> stages.2.windowed_attn_blocks.0.norm1.weight
+        # image_encoder.blocks.6.norm1.weight -> stages.2.windowed_attn_blocks.0.global_attn.norm1.weight
         # image_encoder.blocks.11.mlp.lin2.bias -> stages.3.global_attn_block.mlp.layers.2.bias
         target_prefix = "image_encoder.blocks.#"
         global_prefix = f"stages.{stage_idx}.global_attn_block"
-        windowed_prefix = f"stages.{stage_idx}.windowed_attn_blocks.{block_idx_within_stage}"
+        windowed_prefix = f"stages.{stage_idx}.windowed_attn_blocks.{block_idx_within_stage}.global_attn"
         new_key = replace_prefix(key, target_prefix, global_prefix if is_global_block else windowed_prefix)
+
+        # Rename attention block norm layers to be more descriptive
+        if "norm1" in new_key:
+            return new_key.replace("norm1", "norm_preattn")
+
+        if "norm2" in new_key:
+            return new_key.replace("norm2", "norm_premlp")
 
         # Further handle updates to specific layer names
         if "rel_pos" in new_key:
-            new_key = new_key.replace("rel_pos_h", "relpos.rel_pos_h")
-            new_key = new_key.replace("rel_pos_w", "relpos.rel_pos_w")
+            new_key = new_key.replace("rel_pos_h", "relpos.relpos_h_1d")
+            new_key = new_key.replace("rel_pos_w", "relpos.relpos_w_1d")
             return new_key
 
         # Handle mlp linear layers

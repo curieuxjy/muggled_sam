@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from .components.cross_attention_transformer import CrossAttentionTransformer
-from .components.shared import LayerNorm2d
+from .components.shared import LayerNorm2d, Conv1x1
 
 # For type hints
 from torch import Tensor
@@ -78,7 +78,7 @@ class SAMV1MaskDecoder(nn.Module):
         encoded_image_bchw: Tensor,
         encoded_prompts_bnc: Tensor,
         grid_positional_encoding: Tensor,
-        mask_hint: Tensor | int | None = None,
+        mask_hint: Tensor | None = None,
         blank_promptless_output=True,
     ) -> tuple[Tensor, Tensor]:
         """
@@ -87,51 +87,42 @@ class SAMV1MaskDecoder(nn.Module):
         Also returns estimates for the 'quality' of each segmentation mask.
 
         The mask_hint input can be provided to help 'refine' the model output in some cases.
-        It is expected to be of the same shape as a single mask output by the model. If
-        the mask_hint argument is given as an integer, this is interpretted to mean to
-        run the model twice, once to generate onc eset of masks and then to index out
-        one of those masks to use as a hint for re-running the model.
+        It is expected to be of the same shape as a single mask output by the model.
 
         If 'blank_promptless_output' is true and no prompts are given, then a fully
         'blank' result will be returned instead of running the full decoder.
 
         Returns:
-            mask_predictions, iou_predictions
-            -> Mask prediction has shape: Bx4xHxW, IoU has shape: Bx4
+            mask_predictions, iou_predictions, encoded_cls_tokens
+            -> Mask prediction has shape: Bx4xHxW, IoU has shape: Bx4, cls has shape: Bx5xF
             -> H & W are 4x the size of the image patch encoding size
             -> The 0-th mask was originally intended to be used in cases with
                many prompts, and not to be used with single points/box prompts
+            -> The 'cls' tokens are included for matching SAMv2 outputs,
+               they contain information about the iou & mask results but
+               are not normally needed by an end user
         """
 
         # For clarity
-        batch_size, num_prompts, enc_dim = encoded_prompts_bnc.shape
-        patch_grid_hw = encoded_image_bchw.shape[2:]
+        batch_size_prompts, num_prompts, enc_dim = encoded_prompts_bnc.shape
 
         # Special case, return blank masks if no prompt is given
-        if num_prompts == 0 and blank_promptless_output and not isinstance(mask_hint, Tensor):
-            return self.maskgen.make_blank_results(patch_grid_hw, batch_size)
-
-        # If an integer mask hint is given, interpret it to mean to run the model once, take
-        # the predicted mask (given by the 'hint' as an index) and re-run the model using
-        # the mask as a mask hint
-        if isinstance(mask_hint, int):
-            mask_preds, iou_preds = self(encoded_image_bchw, encoded_prompts_bnc, grid_positional_encoding, None)
-            hint_idx = mask_hint % mask_preds.shape[1]
-            mask_hint = mask_preds[:, hint_idx, :, :]
+        if blank_promptless_output and (num_prompts == 0) and (mask_hint is None):
+            return self.maskgen.make_blank_results(encoded_image_bchw, batch_size_prompts)
 
         # Concatenate learned 'cls' tokens to prompts
         cls_tokens = torch.cat([self.cls_iou_token, self.cls_mask_tokens], dim=0).unsqueeze(0)
-        cls_tokens = cls_tokens.expand(batch_size, -1, -1)
+        cls_tokens = cls_tokens.expand(batch_size_prompts, -1, -1)
         num_cls_tokens = cls_tokens.shape[1]
 
         # Expand per-image data in batch direction to be per-mask, as well as the position encoding
-        img_tokens_bchw = encoded_image_bchw + self.maskhint_encoder(patch_grid_hw, mask_hint)
-        img_tokens_bchw = torch.repeat_interleave(img_tokens_bchw, batch_size, dim=0)
-        img_posenc_bchw = torch.repeat_interleave(grid_positional_encoding, batch_size, dim=0)
+        img_tokens_bchw = self.maskhint_encoder(encoded_image_bchw, mask_hint)
+        img_tokens_bchw = torch.repeat_interleave(img_tokens_bchw, batch_size_prompts, dim=0)
+        img_posenc_bchw = torch.repeat_interleave(grid_positional_encoding, batch_size_prompts, dim=0)
 
         # Cross-encode image tokens with prompt tokens
         prompt_tokens = torch.cat((cls_tokens, encoded_prompts_bnc), dim=1)
-        prompt_tokens, img_tokens = self.transformer(prompt_tokens, img_tokens_bchw, img_posenc_bchw)
+        prompt_tokens, img_tokens_bchw = self.transformer(prompt_tokens, img_tokens_bchw, img_posenc_bchw)
 
         # Extract the (now-encoded) 'cls' tokens by undoing the earlier cls concatenation step
         encoded_cls_tokens = prompt_tokens[:, :num_cls_tokens, :]
@@ -139,10 +130,10 @@ class SAMV1MaskDecoder(nn.Module):
         mask_tokens_out = encoded_cls_tokens[:, 1:, :]
 
         # Produce final output mask & quality predictions
-        mask_preds = self.maskgen(img_tokens, mask_tokens_out, patch_grid_hw)
+        mask_preds = self.maskgen(img_tokens_bchw, mask_tokens_out)
         iou_preds = self.iou_token_mlp(iou_token_out)
 
-        return mask_preds, iou_preds
+        return mask_preds, iou_preds, encoded_cls_tokens
 
     # .................................................................................................................
 
@@ -196,14 +187,10 @@ class MaskGen(nn.Module):
 
     # .................................................................................................................
 
-    def forward(self, image_patch_tokens: Tensor, cls_mask_tokens: Tensor, patch_grid_hw: tuple[int, int]) -> Tensor:
+    def forward(self, image_tokens_bchw: Tensor, cls_mask_tokens: Tensor) -> Tensor:
 
-        b, _, c = image_patch_tokens.shape
-        h, w = patch_grid_hw
-
-        # Convert image tokens to 'image-like' shape and upscale them to final output size
-        image_patch_tokens = image_patch_tokens.transpose(1, 2).view(b, c, h, w)
-        upscaled_img_tokens = self.img_patch_upscaler(image_patch_tokens)
+        # Process/upscale image tokens to final output size
+        upscaled_img_tokens = self.img_patch_upscaler(image_tokens_bchw)
 
         # Further encode cls mask tokens
         encoded_mask_tokens_list = [mlp(cls_mask_tokens[:, i, :]) for i, mlp in enumerate(self.mask_token_mlps)]
@@ -214,20 +201,25 @@ class MaskGen(nn.Module):
 
     # .................................................................................................................
 
-    def make_blank_results(self, patch_grid_hw: tuple[int, int], batch_size: int) -> tuple[Tensor, Tensor]:
+    def make_blank_results(self, image_tokens_bchw: Tensor, batch_size_prompts: int) -> tuple[Tensor, Tensor, Tensor]:
         """Helper used to generate a 'blank' mask, meant for cases where inputs aren't available"""
 
+        # For clarity
+        _, c, h, w = image_tokens_bchw.shape
+
         # Due to upscaler layer, the normal mask output should be 4 times larger than the image encoding size!
-        mask_h, mask_w = [4 * size for size in patch_grid_hw]
-        mask_shape = (batch_size, 4, mask_h, mask_w)
-        iou_shape = (batch_size, 4)
+        mask_h, mask_w = (4 * h, 4 * w)
+        mask_shape = (batch_size_prompts, 4, mask_h, mask_w)
+        iou_shape = (batch_size_prompts, 4)
+        cls_shape = (batch_size_prompts, 5, c)
 
         # Fill in empty mask and IoU prediction values
         device, dtype = self.device_info.device, self.device_info.dtype
         blank_mask_preds = torch.full(mask_shape, -100, device=device, dtype=dtype, requires_grad=False)
         blank_iou_preds = torch.ones(iou_shape, device=device, dtype=dtype, requires_grad=False)
+        blank_cls_tokens = torch.zeros(cls_shape, device=device, dtype=dtype, requires_grad=False)
 
-        return blank_mask_preds, blank_iou_preds
+        return blank_mask_preds, blank_iou_preds, blank_cls_tokens
 
     # .................................................................................................................
 
@@ -267,7 +259,7 @@ class MaskHintEncoder(nn.Module):
             nn.Conv2d(num_hidden_ch_1, num_hidden_ch_2, kernel_size=2, stride=2),
             LayerNorm2d(num_hidden_ch_2),
             nn.GELU(),
-            nn.Conv2d(num_hidden_ch_2, output_channels, kernel_size=1),
+            Conv1x1(num_hidden_ch_2, output_channels),
         )
 
         # Helper variable used to keep track of the model device/dtype (need for mask hints)
@@ -275,34 +267,39 @@ class MaskHintEncoder(nn.Module):
 
     # .................................................................................................................
 
-    def forward(self, patch_grid_hw: tuple[int, int], mask_hint_bhw: Tensor | None) -> Tensor:
+    def forward(self, image_tokens_bchw: Tensor, mask_hint_bhw: Tensor | None) -> Tensor:
         """
-        If a mask hint is provided, it will be encoded to help adjust the 'prompt'
-        when running the mask decoder. If a hint isn't given, then a learned
-        'no-mask' embedding is used instead.
+        If a mask hint is provided, it will be encoded and added to the image tokens
+        If a hint isn't given, then a learned 'no-mask' embedding is used instead.
 
         The mask hint should ideally be 4x the height & width of the patch grid,
         corresponding to the size of the outputs of the mask decoder itself
         -> This seems to be the original intended usage, to feed back output
            masks as prompts for refinement
+        -> For example, with default (1024x1024px) sizing, the mask should be 256x256px
+
+        Returns:
+            hint_encoded_image_tokens_bchw
+            -> Same shape as input image tokens (BxCxHxW)
         """
 
-        # Return no-mask embedding if no hint is provided
-        grid_h, grid_w = patch_grid_hw
+        # Create no-mask embedding if no hint is provided otherwise process mask to form encoded embedding
+        grid_h, grid_w = image_tokens_bchw.shape[2:]
         if mask_hint_bhw is None:
-            return self.no_mask_embed.reshape(1, -1, 1, 1).expand(1, -1, grid_h, grid_w)
+            encoded_mask_hint = self.no_mask_embed.reshape(1, -1, 1, 1).expand(1, -1, grid_h, grid_w)
 
-        # Add batch dimensions, if needed
-        if mask_hint_bhw.ndim == 2:
-            mask_hint_bhw = mask_hint_bhw.unsqueeze(0)
+        else:
+            # Add batch dimension to incoming mask, if needed
+            if mask_hint_bhw.ndim == 2:
+                mask_hint_bhw = mask_hint_bhw.unsqueeze(0)
 
-        # Encode hint and scale to target size if needed
-        encoded_mask_hint = self.downscaler(mask_hint_bhw.to(self.device_info))
-        _, _, hint_h, hint_w = encoded_mask_hint.shape
-        if hint_h != grid_h or hint_w != grid_w:
-            encoded_mask_hint = nn.functional.interpolate(encoded_mask_hint, size=patch_grid_hw)
+            # Encode hint and scale to target size if needed
+            encoded_mask_hint = self.downscaler(mask_hint_bhw.to(self.device_info))
+            _, _, hint_h, hint_w = encoded_mask_hint.shape
+            if hint_h != grid_h or hint_w != grid_w:
+                encoded_mask_hint = nn.functional.interpolate(encoded_mask_hint, size=(grid_h, grid_w))
 
-        return encoded_mask_hint
+        return image_tokens_bchw + encoded_mask_hint
 
     # .................................................................................................................
 

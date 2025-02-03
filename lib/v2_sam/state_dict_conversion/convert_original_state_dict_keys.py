@@ -200,7 +200,7 @@ def _convert_imgenc_keys(
         stage_idx = block_idx_to_stage_idx[orig_block_idx]
         new_block_idx = orig_block_idx - block_idx_offset_by_stage[stage_idx]
         old_prefix = f"trunk.blocks.{orig_block_idx}"
-        new_prefix = f"trunk.stages.{stage_idx}.{new_block_idx}"
+        new_prefix = f"hiera.stages.{stage_idx}.{new_block_idx}"
         new_key = new_key.replace(old_prefix, new_prefix)
 
         return new_key
@@ -436,6 +436,10 @@ def _convert_memfusion_keys(key: str) -> None | str:
     # Rename frame position offset embedding
     if key == "maskmem_tpos_enc":
         return "memconcat.memposenc.base_memposenc_offsets"
+
+    # Rename object pointer projection weights (only present on SAMv2.1)
+    if key.startswith("obj_ptr_tpos_proj"):
+        return key.replace("obj_ptr_tpos_proj", "memconcat.ptrposenc.pointer_pos_proj")
 
     # Remove model name prefix
     if key.startswith("memory_attention"):
